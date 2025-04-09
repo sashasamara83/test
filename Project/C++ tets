@@ -1,0 +1,378 @@
+#include <iostream> // Для ввода/вывода
+#include <fstream>  // Для работы с файлами
+#include <string>   // Для работы со строками
+#include <vector>   // Для работы с динамическими массивами
+#include <filesystem> // Для работы с файловой системой (C++17)
+#include <chrono>   // Для измерения времени и работы с таймером
+#include <thread>   // Для работы с потоками
+#include <algorithm> // Для различных алгоритмов
+#include <atomic>   // Для атомарных операций (безопасных для потоков)
+#include <mutex>    // Для синхронизации доступа к общим ресурсам
+#include <condition_variable> // Для организации ожидания и уведомлений между потоками
+#include <iomanip>  // Для форматирования вывода
+
+#ifdef _WIN32
+#include <windows.h> // Для Windows API (например, для поиска файлов)
+#else
+#include <dirent.h>   // Для POSIX-совместимых систем (Linux, macOS) - работа с директориями
+#include <sys/types.h> // Для определения типов данных (например, для работы с директориями)
+#endif
+
+namespace fs = std::filesystem; // Для удобства использования filesystem
+
+// Структура для хранения настроек пользователя
+struct Config {
+    std::vector<std::string> fileMasks;   // Маски файлов для поиска (например, ".txt", ".bin")
+    bool deleteOriginal;                   // Удалять ли исходные файлы после обработки
+    std::string outputPath;                 // Путь для сохранения обработанных файлов
+    enum class OnDuplicate { Overwrite, Increment } onDuplicate; // Действие при повторении имени выходного файла
+    bool useTimer;                         // Использовать ли таймер для периодического опроса файлов
+    int timerInterval;                       // Интервал таймера в секундах
+    uint64_t xorValue;                       // 8-байтное значение для XOR
+    int numThreads;                        // Количество потоков для параллельной обработки
+};
+
+// Структура для хранения информации о файле, который нужно обработать
+struct FileInfo {
+    std::string inputFilePath;  // Путь к входному файлу
+    std::string outputFilePath; // Путь к выходному файлу
+};
+
+// Глобальные переменные (используйте с осторожностью, но в данном случае оправдано для межпоточного обмена информацией)
+std::atomic<int> filesProcessed(0);  // Количество файлов, успешно обработанных (атомарная переменная)
+std::atomic<int> totalFiles(0);      // Общее количество файлов для обработки (атомарная переменная)
+std::atomic<bool> processingFinished(false); // Флаг, указывающий, завершена ли обработка (атомарная переменная)
+std::mutex progressMutex;           // Мьютекс для защиты доступа к общим данным (например, спискам файлов)
+std::condition_variable progressCV; // Условная переменная для уведомления потока отображения прогресса
+std::vector<std::string> processedFilesList; // Список путей к успешно обработанным файлам
+std::vector<std::string> failedFilesList;    // Список путей к файлам, обработка которых завершилась неудачей
+
+// Функция для получения настроек от пользователя (консольный ввод)
+Config getConfig() {
+    Config config;
+
+    // a) Маска входных файлов
+    std::string masks;
+    std::cout << "Введите маски файлов (через запятую, например .txt,.bin): ";
+    std::getline(std::cin, masks); // Чтение строки с масками
+
+    std::stringstream ss(masks); // Создание потока для разбора строки
+    std::string token;
+    while (std::getline(ss, token, ',')) { // Разбиение строки на маски по разделителю ","
+        config.fileMasks.push_back(token); // Добавление маски в вектор
+    }
+
+    // b) Удалять входные файлы?
+    char deleteChoice;
+    std::cout << "Удалять исходные файлы после обработки? (y/n): ";
+    std::cin >> deleteChoice; // Чтение символа выбора
+    config.deleteOriginal = (deleteChoice == 'y' || deleteChoice == 'Y'); // Преобразование символа в bool
+    std::cin.ignore(); // Очистка буфера ввода после cin >> char (важно!)
+
+    // c) Путь для сохранения результирующих файлов
+    std::cout << "Введите путь для сохранения результирующих файлов: ";
+    std::getline(std::cin, config.outputPath); // Чтение пути
+
+    // d) Действие при повторении имени
+    char duplicateChoice;
+    std::cout << "Действие при повторении имени выходного файла (o - перезапись, i - инкремент): ";
+    std::cin >> duplicateChoice; // Чтение символа выбора
+    config.onDuplicate = (duplicateChoice == 'o' || duplicateChoice == 'O') ? Config::OnDuplicate::Overwrite : Config::OnDuplicate::Increment; // Преобразование символа в enum
+    std::cin.ignore(); // Очистка буфера ввода
+
+    // e) Работа по таймеру?
+    char timerChoice;
+    std::cout << "Использовать таймер? (y/n): ";
+    std::cin >> timerChoice; // Чтение символа выбора
+    config.useTimer = (timerChoice == 'y' || timerChoice == 'Y'); // Преобразование символа в bool
+    std::cin.ignore(); // Очистка буфера
+
+    // f) Периодичность опроса (если таймер)
+    if (config.useTimer) {
+        std::cout << "Введите периодичность опроса (в секундах): ";
+        std::cin >> config.timerInterval; // Чтение интервала
+        std::cin.ignore(); // Очистка буфера
+    } else {
+        config.timerInterval = 0; // Если таймер не используется, интервал равен 0
+    }
+
+    // g) Значение 8 байт для XOR
+    std::cout << "Введите 8-байтное значение для XOR (в шестнадцатеричном формате, например 0xFFFFFFFFFFFFFFFF): ";
+    std::cin >> std::hex >> config.xorValue; // Чтение значения в шестнадцатеричном формате
+    std::cin.ignore(); // Очистка буфера
+    std::cout << std::dec; // Возврат к десятичному вводу (для последующих операций ввода)
+
+    // h) Количество потоков
+    std::cout << "Введите количество потоков для обработки: ";
+    std::cin >> config.numThreads; // Чтение количества потоков
+    std::cin.ignore(); // Очистка буфера
+
+    return config; // Возврат настроек
+}
+
+// Функция для модификации файла XOR'ом (теперь принимает FileInfo)
+bool modifyFile(const FileInfo& fileInfo, uint64_t xorValue, bool deleteOriginal) {
+    std::ifstream inputFile(fileInfo.inputFilePath, std::ios::binary); // Открытие входного файла в бинарном режиме
+    if (!inputFile.is_open()) { // Проверка на успешное открытие
+        std::cerr << "Ошибка открытия входного файла: " << fileInfo.inputFilePath << std::endl;
+        {
+            std::lock_guard<std::mutex> lock(progressMutex); // Захват мьютекса для защиты списка
+            failedFilesList.push_back(fileInfo.inputFilePath); // Добавление файла в список неудачных
+        }
+        return false; // Возврат false при ошибке
+    }
+
+    std::ofstream outputFile(fileInfo.outputFilePath, std::ios::binary); // Открытие выходного файла в бинарном режиме
+    if (!outputFile.is_open()) { // Проверка на успешное открытие
+        std::cerr << "Ошибка открытия выходного файла: " << fileInfo.outputFilePath << std::endl;
+        inputFile.close(); // Закрытие входного файла (если он был открыт)
+        {
+            std::lock_guard<std::mutex> lock(progressMutex); // Захват мьютекса
+            failedFilesList.push_back(fileInfo.inputFilePath); // Добавление файла в список неудачных
+        }
+        return false; // Возврат false при ошибке
+    }
+
+    char buffer[8]; // Буфер для чтения 8 байт (размер uint64_t)
+    while (inputFile.read(buffer, sizeof(buffer))) { // Чтение данных из входного файла
+        uint64_t data;
+        std::memcpy(&data, buffer, sizeof(data)); // Копирование данных из буфера в переменную uint64_t
+        data ^= xorValue; // Выполнение операции XOR
+        std::memcpy(buffer, &data, sizeof(data)); // Копирование результата обратно в буфер
+        outputFile.write(buffer, sizeof(buffer)); // Запись данных в выходной файл
+    }
+
+    // Обработка остатка, если размер файла не кратен 8
+    std::streamsize bytesRead = inputFile.gcount(); // Получение количества фактически прочитанных байт
+    if (bytesRead > 0) { // Если были прочитаны байты
+        uint64_t data = 0;
+        std::memcpy(&data, buffer, bytesRead); // Копирование остатка данных в переменную uint64_t
+        data ^= xorValue; // Выполнение XOR
+        std::memcpy(buffer, &data, bytesRead); // Копирование результата обратно в буфер
+        outputFile.write(buffer, bytesRead); // Запись остатка в выходной файл
+    }
+
+    inputFile.close();  // Закрытие входного файла
+    outputFile.close(); // Закрытие выходного файла
+
+    // Атомарно увеличиваем счетчик обработанных файлов
+    filesProcessed++; // Увеличение счетчика
+
+    {
+        std::lock_guard<std::mutex> lock(progressMutex); // Захват мьютекса
+        processedFilesList.push_back(fileInfo.inputFilePath); // Добавление файла в список успешных
+    }
+
+
+    if (deleteOriginal) { // Если нужно удалять исходные файлы
+        try {
+            fs::remove(fileInfo.inputFilePath); // Удаление файла
+            std::cout << "Исходный файл удален: " << fileInfo.inputFilePath << std::endl;
+        } catch (const std::exception& e) { // Обработка исключений при удалении
+            std::cerr << "Ошибка удаления исходного файла: " << fileInfo.inputFilePath << " - " << e.what() << std::endl;
+            {
+                std::lock_guard<std::mutex> lock(progressMutex); // Захват мьютекса
+                failedFilesList.push_back(fileInfo.inputFilePath); // Добавление в список неудачных
+            }
+        }
+    }
+
+
+    return true; // Возврат true при успехе
+}
+
+// Функция для поиска файлов по маске
+std::vector<FileInfo> findFilesByMask(const std::string& directory, const std::vector<std::string>& fileMasks, Config& config) {
+    std::vector<FileInfo> foundFiles; // Вектор для хранения информации о найденных файлах
+
+#ifdef _WIN32
+    // Windows implementation
+    WIN32_FIND_DATAW findFileData; // Структура для хранения информации о файле
+    HANDLE hFind = INVALID_HANDLE_VALUE; // Дескриптор поиска
+
+    for (const auto& mask : fileMasks) { // Перебор масок
+        std::wstring wmask(mask.begin(), mask.end()); // Преобразование маски в wide string (для Windows API)
+        std::wstring searchPath = std::wstring(directory.begin(), directory.end()) + L"\\" + wmask; // Формирование пути поиска
+
+        hFind = FindFirstFileW(searchPath.c_str(), &findFileData); // Начало поиска
+
+        if (hFind != INVALID_HANDLE_VALUE) { // Если поиск успешен
+            do {
+                std::wstring ws(findFileData.cFileName); // Получение имени файла
+                std::string filename(ws.begin(), ws.end()); // Преобразование имени в string
+
+                if ((findFileData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) { // Исключение директорий
+                    std::string inputFilePath = directory + "\\" + filename; // Формирование полного пути к входному файлу
+                    std::string outputFilePath = config.outputPath + "/" + filename; // Формирование полного пути к выходному файлу
+
+                    // Обработка дубликатов
+                    if (config.onDuplicate == Config::OnDuplicate::Increment && fs::exists(outputFilePath)) {
+                        outputFilePath = generateUniqueFilename(outputFilePath); // Генерация уникального имени
+                    }
+
+                    foundFiles.push_back({inputFilePath, outputFilePath}); // Добавление информации о файле в вектор
+
+                }
+            } while (FindNextFileW(hFind, &findFileData) != 0); // Продолжение поиска
+
+            FindClose(hFind); // Закрытие дескриптора поиска
+        }
+    }
+#else
+    // POSIX implementation (Linux, macOS)
+    DIR *dir; // Дескриптор директории
+    struct dirent *ent; // Структура для хранения информации о файле
+
+    if ((dir = opendir(directory.c_str())) != NULL) { // Открытие директории
+        while ((ent = readdir(dir)) != NULL) { // Чтение содержимого директории
+            std::string filename = ent->d_name; // Получение имени файла
+            if (filename == "." || filename == "..") continue; // Игнорирование "." и ".."
+
+            for (const auto& mask : fileMasks) { // Перебор масок
+                // Проверка маски
+                if (filename.size() >= mask.size() && filename.substr(filename.size() - mask.size()) == mask) {
+                   std::string inputFilePath = directory + "/" + filename; // Формирование полного пути к входному файлу
+                   std::string outputFilePath = config.outputPath + "/" + filename; // Формирование полного пути к выходному файлу
+
+                    // Обработка дубликатов
+                    if (config.onDuplicate == Config::OnDuplicate::Increment && fs::exists(outputFilePath)) {
+                        outputFilePath = generateUniqueFilename(outputFilePath); // Генерация уникального имени
+                    }
+
+                   foundFiles.push_back({inputFilePath, outputFilePath}); // Добавление информации о файле в вектор
+                   break; // Чтобы один файл не добавлялся несколько раз
+                }
+            }
+        }
+        closedir(dir); // Закрытие директории
+    } else {
+        perror("Не удалось открыть директорию"); // Вывод сообщения об ошибке
+    }
+#endif
+
+    return foundFiles; // Возврат вектора с информацией о найденных файлах
+}
+
+// Функция для генерации уникального имени файла при дублировании
+std::string generateUniqueFilename(const std::string& filePath) {
+    std::string dir = fs::path(filePath).parent_path().string(); // Получение пути к директории
+    std::string filename = fs::path(filePath).stem().string();      // Получение имени файла без расширения
+    std::string extension = fs::path(filePath).extension().string(); // Получение расширения файла
+    int counter = 1;                                             // Счетчик для добавления к имени
+    std::string newFilePath = filePath;                             // Новое имя файла
+
+    while (fs::exists(newFilePath)) { // Пока файл с таким именем существует
+        newFilePath = dir + "/" + filename + "_" + std::to_string(counter) + extension; // Формирование нового имени
+        counter++; // Увеличение счетчика
+    }
+
+    return newFilePath; // Возврат уникального имени файла
+}
+
+// Функция для отображения прогресса обработки
+void displayProgress() {
+    while (!processingFinished) { // Пока обработка не завершена
+        {
+            std::unique_lock<std::mutex> lock(progressMutex); // Захват мьютекса для защиты общих данных
+            progressCV.wait_for(lock, std::chrono::seconds(1)); // Ожидание уведомления или таймаут в 1 секунду
+
+            int processed = filesProcessed.load(); // Получение количества обработанных файлов
+            int total = totalFiles.load();        // Получение общего количества файлов
+            double progress = (total > 0) ? (double)processed / total * 100.0 : 0.0; // Вычисление прогресса в процентах
+
+            std::cout << "\rПрогресс: " << processed << "/" << total << " (" << std::fixed << std::setprecision(2) << progress << "%)" << std::flush; // Вывод прогресса в консоль
+        }
+    }
+    // Финальный вывод после завершения обработки
+    std::cout << "\rПрогресс: " << filesProcessed.load() << "/" << totalFiles.load() << " (100.00%)" << std::endl; // Убедимся, что отображается 100%
+
+    std::cout << "Обработанные файлы:" << std::endl;
+    for (const auto& file : processedFilesList) { // Вывод списка обработанных файлов
+        std::cout << "  " << file << std::endl;
+    }
+
+    std::cout << "Не удалось обработать файлы:" << std::endl;
+    for (const auto& file : failedFilesList) { // Вывод списка файлов, которые не удалось обработать
+        std::cout << "  " << file << std::endl;
+    }
+}
+
+// Функция для обработки файлов в потоке
+void processFilesThread(std::vector<FileInfo>& filesToProcess, Config& config, int threadId) {
+    while (true) { // Бесконечный цикл, пока есть файлы для обработки
+        FileInfo fileInfo;
+
+        // Захватываем мьютекс для безопасного доступа к вектору файлов
+        {
+            std::lock_guard<std::mutex> lock(progressMutex); // Захват мьютекса
+            if (filesToProcess.empty()) { // Если вектор пуст, то больше нет файлов для обработки
+                break; // Выход из цикла
+            }
+            fileInfo = filesToProcess.back(); // Получение последнего элемента вектора
+            filesToProcess.pop_back();       // Удаление последнего элемента вектора
+        }
+
+        std::cout << "Поток " << threadId << ": Обработка файла: " << fileInfo.inputFilePath << " -> " << fileInfo.outputFilePath << std::endl; // Вывод сообщения о начале обработки
+        if (!modifyFile(fileInfo, config.xorValue, config.deleteOriginal)) { // Вызов функции для обработки файла
+            std::cerr << "Поток " << threadId << ": Ошибка при обработке файла: " << fileInfo.inputFilePath << std::endl; // Вывод сообщения об ошибке
+        }
+    }
+}
+
+
+int main() {
+    Config config = getConfig(); // Получение настроек от пользователя
+
+    auto processFiles = [&]() { // Лямбда-функция для обработки файлов
+        std::string currentPath = fs::current_path().string(); // Получение текущей директории
+        std::vector<FileInfo> filesToProcess = findFilesByMask(currentPath, config.fileMasks, config); // Поиск файлов для обработки
+
+        // Устанавливаем общее количество файлов
+        totalFiles = filesToProcess.size(); // Установка общего количества файлов
+        filesProcessed = 0;                 // Сброс счетчика обработанных файлов
+
+        std::cout << "Найдено " << totalFiles << " файлов для обработки." << std::endl;
+
+        if (totalFiles == 0) { // Если нет файлов для обработки
+            std::cout << "Нет файлов для обработки." << std::endl;
+            processingFinished = true; // Установка флага завершения
+            return; // Выход из функции
+        }
+
+        // Запускаем потоки
+        std::vector<std::thread> threads; // Вектор для хранения потоков
+        for (int i = 0; i < config.numThreads; ++i) { // Создание потоков
+            threads.emplace_back(processFilesThread, std::ref(filesToProcess), std::ref(config), i + 1); // Создание и запуск потока
+        }
+
+        // Запускаем поток для отображения прогресса
+        std::thread progressThread(displayProgress); // Создание и запуск потока для отображения прогресса
+
+        // Ждем завершения всех потоков
+        for (auto& thread : threads) { // Ожидание завершения каждого потока
+            thread.join(); // Ожидание завершения потока
+        }
+
+        // Сообщаем, что обработка завершена
+        processingFinished = true; // Установка флага завершения
+        progressCV.notify_one(); // Уведомление потока отображения прогресса о завершении
+
+        progressThread.join(); // Ожидание завершения потока отображения прогресса
+
+    };
+
+    if (config.useTimer) { // Если используется таймер
+        while (true) { // Бесконечный цикл
+            // Сбрасываем флаг завершения обработки перед каждым запуском таймера
+            processingFinished = false; // Сброс флага
+            processFiles(); // Обработка файлов
+            std::this_thread::sleep_for(std::chrono::seconds(config.timerInterval)); // Ожидание интервала таймера
+        }
+    } else {
+        processFiles(); // Обработка файлов (без таймера)
+    }
+
+    std::cout << "Работа завершена." << std::endl; // Вывод сообщения о завершении
+
+    return 0; // Возврат 0 (успешное завершение)
+}
